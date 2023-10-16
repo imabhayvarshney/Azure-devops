@@ -1,0 +1,456 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: 
+  - main
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: 'Terraform-dev'  
+  - group : 'Dev_vg'
+  - group : 'Qa_vg'
+  - group : 'Uat_vg'
+  - group : 'Prod_vg'
+  
+  
+stages:
+  #BUILD..
+  - stage: Build
+    displayName: 'Build the code' 
+    jobs:
+    - job: 'Build'
+      pool: 
+        vmImage: ubuntu-latest
+      variables:
+        - group: 'Terraform-dev'
+      steps:
+      
+        - powershell: |
+            $commitHash = git rev-parse HEAD
+            Write-Host "Commit Hash: $commitHash"
+          displayName: 'Getting Hash code'
+
+        - powershell: |
+            $commitHash = git rev-parse HEAD
+            git tag 1.1.0 $commitHash
+            $tags = git tag --contains $commitHash
+            Write-Host "Tags associated with the commit: $tags"
+          displayName: 'Get Tags for Commit'
+
+        - script: |
+            echo "Commit Message:$(Build.SourceVersionMessage)"
+            commit_messages=$(Build.SourceVersionMessage)
+            pattern= "^[A-Za-z0-9]+-[0-9]+$"
+            if [[ $commit_messages =~ ^([A-Za-z0-9]+)-([0-9]+$) ]]; then
+            #if [[ $commit_messages =~ $pattern ]]; then
+              echo "Commit message is valid."
+            else
+              echo "$(Build.SourceVersionMessage) is not valid . It should match the pattern: $PATTERN"
+              exit 1  # Exit with an error code to fail the pipeline
+            fi
+          displayName: 'Validate Commit Message'
+
+        - script: echo "##vso[build.updatebuildnumber]$(newBuildNumberFormat)$(Build.BuildNumber)"
+          displayName: 'Set Custom Build Number'
+                    
+        - task: TerraformInstaller@0
+          inputs:
+            terraformVersion: $(Terraform-version)
+          displayName: 'Terraform Install'
+
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: 'Allserviceconnection'
+            backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+            backendAzureRmStorageAccountName: 'myadotaskstorage'
+            backendAzureRmContainerName: 'myadotaskcontainer'
+            backendAzureRmKey: 'terraform.tfstate'
+          displayName: 'Terraform Init'
+            
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'custom'
+            customCommand: 'fmt'
+            commandOptions: '--recursive'
+            outputTo: 'console'
+            environmentServiceNameAzureRM: 'Allserviceconnection'
+          displayName: 'Formatted'   
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'custom'
+            customCommand: 'fmt'
+            commandOptions: '-check'
+            outputTo: 'console'
+            environmentServiceNameAzureRM: 'Allserviceconnection'
+          displayName: 'Format Check'  
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'validate'
+          displayName: 'Validate'           
+        - task: CopyFiles@2
+          inputs:
+            Contents: '**'
+            TargetFolder: '$(Build.ArtifactStagingDirectory)'
+          displayName: 'Copy_files' 
+            
+        - task: ArchiveFiles@2
+          inputs:
+            rootFolderOrFile: '$(Build.SourcesDirectory)'
+            includeRootFolder: true
+            archiveType: 'zip'
+            archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+          displayName: 'Archieving'   
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'iac.terraform.$(Build.BuildId).zip'
+            publishLocation: 'Container'
+          displayName: 'Publishing_Artifact'  
+
+  #QA_ENVIRONMENT..
+  - stage: QA_PLAN
+    dependsOn: Build
+    displayName: 'Plan to QA' 
+    jobs:
+    - job: 'PlanToQA'
+      variables:
+        - group: 'Qa_vg'
+      #environment: DEV
+      steps:
+        - task: DownloadBuildArtifacts@1
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: 'iac.terraform.$(Build.BuildId).zip'
+            downloadPath: '$(System.ArtifactsDirectory)'
+          displayName: 'Download the Build'  
+          
+        - task: TerraformInstaller@0
+          inputs:
+            terraformVersion: $(Terraform-version)
+          displayName: 'Terraform Install'  
+            
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: 'Allserviceconnection'
+            backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+            backendAzureRmStorageAccountName: 'myadotaskstorage'
+            backendAzureRmContainerName: 'myadotaskcontainer'
+            backendAzureRmKey: 'Qa/terraform.tfstate'
+          displayName: 'Terraform Init'
+                      
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            commandOptions: '-var-file="Qa/Qaterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+            environmentServiceNameAzureRM: 'Allserviceconnection'
+          displayName: 'Terraform Plan'  
+
+  #QA_Environment
+  - stage: QA_APPLY
+    dependsOn: QA_PLAN
+    displayName: 'Apply to QA' 
+    jobs:
+      # Track deployments on the environment.
+      - deployment: Deploy_to_QA
+        displayName: Deploy_to_QA
+        variables:
+        - group: 'Qa_vg'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'QA'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self 
+              - task: TerraformInstaller@0
+                inputs:
+                  terraformVersion: $(Terraform-version)
+                displayName: 'Terraform Install'
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'init'
+                  backendServiceArm: 'Allserviceconnection'
+                  backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+                  backendAzureRmStorageAccountName: 'myadotaskstorage'
+                  backendAzureRmContainerName: 'myadotaskcontainer'
+                  backendAzureRmKey: 'Qa/terraform.tfstate'
+                displayName: 'Terraform Init'  
+                    
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'apply'
+                  commandOptions: '-var-file="Qa/Qaterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+                  environmentServiceNameAzureRM: 'Allserviceconnection'
+                displayName: 'Terraform Apply'
+
+    #DEV Stage......................
+  - stage: DEV_PLAN
+    dependsOn: Build
+    displayName: 'Plan to DEV' 
+    jobs:
+    - job: 'PlanToDEV'
+      variables:
+        - group: 'Dev_vg'
+      #environment: DEV
+      steps:
+        - task: DownloadBuildArtifacts@1
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: 'iac.terraform.$(Build.BuildId).zip'
+            downloadPath: '$(System.ArtifactsDirectory)'
+          displayName: 'Download_Build'  
+          
+        - task: TerraformInstaller@0
+          inputs:
+            terraformVersion: $(Terraform-version)
+          displayName: 'Terraform Install'  
+            
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: 'Allserviceconnection'
+            backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+            backendAzureRmStorageAccountName: 'myadotaskstorage'
+            backendAzureRmContainerName: 'myadotaskcontainer'
+            backendAzureRmKey: 'Dev/terraform.tfstate'
+          displayName: 'Terraform Init'
+                      
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            commandOptions: '-var-file="Dev/Devterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+            environmentServiceNameAzureRM: 'Allserviceconnection'
+          displayName: 'Terraform Plan'  
+
+  - stage: DEV_APPLY
+    dependsOn: DEV_PLAN
+    displayName: 'Apply to DEV' 
+    jobs:
+      # Track deployments on the environment.
+      - deployment: DEPLOY_TO_DEV
+        displayName: DEPLOY_TO_DEV
+        variables:
+        - group: 'Dev_vg'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'DEV'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self 
+              - task: TerraformInstaller@0
+                inputs:
+                  terraformVersion: $(Terraform-version)
+                displayName: 'Terraform Install'
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'init'
+                  backendServiceArm: 'Allserviceconnection'
+                  backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+                  backendAzureRmStorageAccountName: 'myadotaskstorage'
+                  backendAzureRmContainerName: 'myadotaskcontainer'
+                  backendAzureRmKey: 'Dev/terraform.tfstate'
+                displayName: 'Terraform Init'  
+                    
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'apply'
+                  commandOptions: '-var-file="Dev/Devterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+                  environmentServiceNameAzureRM: 'Allserviceconnection'
+                displayName: 'Terraform Apply'
+                
+    #UAT Stage......................
+  - stage: UAT_PLAN
+    dependsOn: [QA_APPLY,DEV_APPLY]
+    displayName: 'Plan to UAT' 
+    jobs:
+    - job: 'PlanToUAT'
+      variables:
+        - group: 'Uat_vg'
+      #environment: DEV
+      steps:
+        - task: DownloadBuildArtifacts@1
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: 'iac.terraform.$(Build.BuildId).zip'
+            downloadPath: '$(System.ArtifactsDirectory)'
+          displayName: 'Downloading Artifact'
+          
+        - task: TerraformInstaller@0
+          inputs:
+            terraformVersion: $(Terraform-version)
+          displayName: 'Terraform Install'  
+          
+            
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: 'Allserviceconnection'
+            backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+            backendAzureRmStorageAccountName: 'myadotaskstorage'
+            backendAzureRmContainerName: 'myadotaskcontainer'
+            backendAzureRmKey: 'Uat/terraform.tfstate'
+          displayName: 'Terraform Init'
+                      
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            commandOptions: '-var-file="Uat/Uatterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+            environmentServiceNameAzureRM: 'Allserviceconnection'
+          displayName: 'Terraform Plan'  
+
+  - stage: UAT_APPLY
+    dependsOn: UAT_PLAN
+    displayName: 'Apply to UAT' 
+    jobs:
+      # Track deployments on the environment.
+      - deployment: DEPLOY_TO_UAT
+        displayName: DEPLOY_TO_UAT
+        variables:
+        - group: 'Uat_vg'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'UAT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self 
+              - task: TerraformInstaller@0
+                inputs:
+                  terraformVersion: $(Terraform-version)
+                displayName: 'Terraform Install'
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'init'
+                  backendServiceArm: 'Allserviceconnection'
+                  backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+                  backendAzureRmStorageAccountName: 'myadotaskstorage'
+                  backendAzureRmContainerName: 'myadotaskcontainer'
+                  backendAzureRmKey: 'Uat/terraform.tfstate'
+                displayName: 'Terraform Init'  
+                    
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'apply'
+                  commandOptions: '-var-file="Uat/Uatterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+                  environmentServiceNameAzureRM: 'Allserviceconnection'
+                displayName: 'Terraform Apply'
+
+    #PROD Stage......................
+  - stage: PROD_PLAN
+    dependsOn: UAT_APPLY
+    displayName: 'Plan to PROD' 
+    jobs:
+    - job: 'PlanToPROD'
+      variables:
+        - group: 'Prod_vg'
+      #environment: DEV
+      steps:
+        - task: DownloadBuildArtifacts@1
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: 'iac.terraform.$(Build.BuildId).zip'
+            downloadPath: '$(System.ArtifactsDirectory)'
+          
+        - task: TerraformInstaller@0
+          inputs:
+            terraformVersion: $(Terraform-version)
+          displayName: 'Terraform Install'  
+            
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: 'Allserviceconnection'
+            backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+            backendAzureRmStorageAccountName: 'myadotaskstorage'
+            backendAzureRmContainerName: 'myadotaskcontainer'
+            backendAzureRmKey: 'Prod/terraform.tfstate'
+          displayName: 'Terraform Init'
+                      
+        - task: TerraformTaskV4@4
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            commandOptions: '-var-file="Prod/Prodterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+            environmentServiceNameAzureRM: 'Serviceconnection'
+          displayName: 'Terraform Plan'  
+
+  - stage: PROD_APPLY
+    dependsOn: PROD_PLAN
+    displayName: 'Apply to PROD' 
+    jobs:
+      # Track deployments on the environment.
+      - deployment: DEPLOY_TO_PROD
+        displayName: DEPLOY_TO_PROD
+        variables:
+        - group: 'Prod_vg'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'PROD'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self 
+              - task: TerraformInstaller@0
+                inputs:
+                  terraformVersion: $(Terraform-version)
+                displayName: 'Terraform Install'
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'init'
+                  backendServiceArm: 'Allserviceconnection'
+                  backendAzureRmResourceGroupName: 'rg-adolearn-MyADOtaskproject-tfstate'
+                  backendAzureRmStorageAccountName: 'myadotaskstorage'
+                  backendAzureRmContainerName: 'myadotaskcontainer'
+                  backendAzureRmKey: 'Prod/terraform.tfstate'
+                displayName: 'Terraform Init'  
+                    
+              - task: TerraformTaskV4@4
+                inputs:
+                  provider: 'azurerm'
+                  command: 'apply'
+                  commandOptions: '-var-file="Prod/Prodterraform.tfvars" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(sql-login)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(sql-password)"'
+                  environmentServiceNameAzureRM: 'Allserviceconnection'
+                displayName: 'Terraform Apply'
+
+
+
+
+
+
+
+
+
+    
+

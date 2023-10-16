@@ -1,0 +1,218 @@
+# ASP.NET Core (.NET Framework)
+# Build and test ASP.NET Core projects targeting the full .NET Framework.
+# Add steps that publish symbols, save build artifacts, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/dotnet-core
+
+
+trigger:  
+  - main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  newBuildNumberFormat:  'Infra-CI-CD-'
+  ASPNETCORE_ENVIRONMENT: 'Production'
+
+stages:
+  #BUILD..
+  - stage: Build
+    displayName: 'Build the code' 
+    jobs:
+    - job: 'Build'
+      pool: 
+        vmImage: windows-latest
+      variables:
+        - group: 'Terraform-dev'
+        
+      steps:
+      - task: UseDotNet@2
+        inputs:
+          packageType: 'sdk'
+          version: '7.0.x'
+
+      - task: AzureCLI@2
+        inputs:
+          azureSubscription: 'Allserviceconnection'
+          scriptType: 'ps'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            $webAppName = "app-task-centralus-prod"
+            $resourceGroupName = "rg-task-centralus-prod"
+            az webapp config appsettings set --resource-group $resourceGroupName --name $webAppName --settings ASPNETCORE_ENVIRONMENT="Production"
+        displayName: 'Import ASPNETCORE_ENVIRONMENT into Azure Web App'
+        enabled: true   
+
+      - powershell: |
+          # Validate commit message format
+          $commitMessage = "$(Build.SourceVersionMessage)"
+          if ($commitMessage -notmatch '[A-Za-z0-9]-[0-9]') {
+          Write-Host "Commit message format is invalid. It should start with {Project-code}-{work-item-number} followed by a comment."
+          exit 1
+          }
+        displayName: 'Validate Commit Message Format'
+
+      - powershell: |
+          # Update the build number
+          $oldBuildNumber = "$(Build.BuildNumber)"
+          $newBuildNumber = "Infra-CI-CD-$(Get-Date -Format 'yyyy.MM.dd').$(Build.BuildId)"
+          Write-Host "Updating Build Number from '$oldBuildNumber' to '$newBuildNumber'"
+          Write-Host "##vso[build.updatebuildnumber]$newBuildNumber"
+        
+      # - task: DotNetCoreCLI@2
+      #   inputs:
+      #     command: 'restore'
+      #     projects: '**/*.csproj'
+      #     feedsToUse: 'select' 
+      # - task: DotNetCoreCLI@2
+      #   inputs:
+      #     command: 'build'
+      #     projects: '**/*.csproj'
+       
+      - task: NuGetToolInstaller@1
+
+      - task: NuGetCommand@2
+        inputs:
+          restoreSolution: '**/*.sln'
+
+      - task: VSBuild@1
+        inputs:
+          solution: '**/*.sln'
+          msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:DesktopBuildPackageLocation="$(build.artifactStagingDirectory)\WebApp.zip" /p:DeployIisAppPath="Default Web Site"'
+          platform: 'Any CPU'
+          configuration: 'Release'
+
+      - task: VSTest@2
+        inputs:
+          platform: 'Any CPU'
+          configuration: 'Release'
+
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            dotnet tool install --global dotnet-ef
+            dotnet ef migrations script --idempotent --project $(System.DefaultWorkingDirectory)/DotNetCoreSqlDb/DotNetCoreSqlDb.csproj --output $(Build.ArtifactStagingDirectory)/db.sql -i
+
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            dotnet build $(System.DefaultWorkingDirectory)/DotNetCoreSqlDb/DotNetCoreSqlDb.csproj -c Release
+            dotnet publish $(System.DefaultWorkingDirectory)/DotNetCoreSqlDb/DotNetCoreSqlDb.csproj -c Release -o $(Build.ArtifactStagingDirectory)/app-publish
+            ls
+        displayName: 'Build and Publish Application Code'
+      # - task: ArchiveFiles@2
+      #   inputs:
+      #     rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/app-publish'
+      #     includeRootFolder: true
+      #     archiveType: 'zip'
+      #     archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+      #     replaceExistingArchive: true
+        
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/app-publish'
+          ArtifactName: 'AppCode'
+      - task: CopyFiles@2
+        inputs:
+          SourceFolder: '$(Build.ArtifactStagingDirectory)'
+          Contents: '**/*.sql'
+          TargetFolder: '$(Build.ArtifactStagingDirectory)/sql-migrations'
+          
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/sql-migrations'
+          ArtifactName: 'SqlMigrations'
+        condition: succeededOrFailed()
+
+  - stage: Deploy_App
+    dependsOn: Build
+    displayName: 'Deploy_App' 
+    jobs:
+    - deployment: DEPLOY_TO_PROD
+      displayName: DEPLOY_TO_PROD
+      pool: 
+        vmImage: windows-latest
+      variables:
+        #sqlFilePath: $(Pipeline.Workspace)/SqlMigrations/db.sql  
+        - group: 'Terraform-dev'
+      
+      environment: 'PROD'
+      strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self 
+              - task: DownloadBuildArtifacts@1
+                inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'SqlMigrations'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+                displayName: 'Download the Build'  
+            
+              - task: UseDotNet@2
+                inputs:
+                  packageType: 'sdk'
+                  version: '7.0.x'
+
+              # - task: SqlAzureDacpacDeployment@1
+              #   inputs:
+              #     azureSubscription: 'Serviceconnection'
+              #     AuthenticationType: 'server'
+              #     ServerName: 'sql-task-centralus-prod.database.windows.net'
+              #     DatabaseName: 'sqldb-task-centralus-prod'
+              #     SqlUsername: 'abhay'
+              #     SqlPassword: 'abcd@!1234'
+              #     deployType: 'SqlTask'
+              #     SqlFile: '$(Build.ArtifactStagingDirectory)/SqlMigrations/db.sql'
+              #     IpDetectionMethod: 'AutoDetect'
+
+              - task: DownloadBuildArtifacts@1
+                inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'AppCode'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+                displayName: 'Download the Build'
+
+              - task: SqlAzureDacpacDeployment@1
+                inputs:
+                  azureSubscription: 'Allserviceconnection'
+                  AuthenticationType: 'server'
+                  ServerName: 'sql-task-centralus-prod.database.windows.net'
+                  DatabaseName: 'sqldb-task-centralus-prod'
+                  SqlUsername: '$(sql-login)'
+                  SqlPassword: '$(sql-password)'
+                  deployType: 'SqlTask'
+                  SqlFile: '$(Build.ArtifactStagingDirectory)/SqlMigrations/db.sql'
+                  IpDetectionMethod: 'AutoDetect'
+              - task: AzureWebApp@1
+                inputs:
+                  azureSubscription: 'Allserviceconnection'
+                  appType: 'webApp'
+                  appName: 'app-task-centralus-prod'
+                  deployToSlotOrASE: true
+                  resourceGroupName: 'rg-task-centralus-prod'
+                  slotName: 'app-task-centralus-prod'
+                  package: '$(System.ArtifactsDirectory)/AppCode'
+                  deploymentMethod: 'auto'    
+
+
+  # - stage: Swap_Slots
+  #   displayName: 'Swap_Slots'
+  #   jobs:
+  #   - job: Swap_Slots
+  #     steps:
+  #     - task: AzureAppServiceManage@0
+  #       inputs:
+  #         azureSubscription: 'Allserviceconnection'
+  #         Action: 'Swap Slots'
+  #         WebAppName: 'app-task-centralus-prod'
+  #         ResourceGroupName: 'rg-task-centralus-prod'
+  #         SourceSlot: 'app-task-centralus-prod'
+
